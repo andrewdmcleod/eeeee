@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+
+import sys
+import requests
+import json
+import argparse
+from datetime import datetime
+
+""" Get github gists for USERNAME - shows new gists. Optionally shows all gists
+and/or deleted gists """
+
+gh_api_url = "https://api.github.com/users/USERNAME/gists"
+gists = []
+
+
+def get_args(*args):
+    """ Required and optional command line arguments """
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('username', help='github username - required')
+    parser.add_argument('-p', '--print_all',
+                        help='dont just print new gists',
+                        action="store_true")
+    parser.add_argument('-d', '--deleted',
+                        help='also show deleted gists',
+                        action="store_true")
+    parser.add_argument('-r', '--rate',
+                        help='check current rate limits and exit',
+                        action="store_true")
+    args = parser.parse_args()
+    return (args.username, args.print_all, args.deleted, args.rate)
+
+
+def rate_limit():
+    """ For unauthenticated requests, the rate limit allows for up to 60
+    requests per hour.  Unauthenticated requests are associated with the
+    originating IP address, and not the user making requests.
+
+    https://docs.github.com/en/rest/overview/resources-in-the-rest-api#rate-limiting
+    """
+    headers = {'Accept': 'application/vnd.github.v3+json'}
+    url = "https://api.github.com/rate_limit"
+    response = requests.get(url, headers)
+    for item in response.json()['resources']['core'].items():
+        if "reset" in item:
+            realtime = datetime.fromtimestamp(item[1])
+            print("{}: {} ({})".format(item[0], item[1], realtime))
+        else:
+            print("{}: {}".format(item[0], item[1]))
+
+
+def get_gists(username):
+    """ Query public gists for USERNAME and monitor for new gists
+
+    When unauthenticated, the Github REST API has a rate limit of 60req/hour.
+    Therefore, the default check rate is 15 minutes, but a hard limit of 11
+    minutes is imposed.  """
+
+    api_url = gh_api_url.replace('USERNAME', username)
+    page = 1
+    while(True):
+        headers = {'Accept': 'application/vnd.github.v3+json',
+                   'per_page': '100', 'page': page}
+        response = requests.get(api_url, headers)
+
+        if "200" not in str(response):
+            print(json.loads(response.text)['message'])
+            sys.exit()
+        for item in response.json():
+            filename = list(item['files'].values())[0]['filename']
+            created_at = item['created_at']
+            gist_url = item['url']
+            new_entry = {"date": created_at, "url": gist_url,
+                         "filename": filename}
+            gists.append(new_entry)
+        try:
+            if "next" in response.headers['link']:
+                page += 1
+                print("getting next page: {}".format(page))
+            else:
+                break
+        except KeyError:
+            print("Only one page of results")
+            break
+
+    return gists
+
+
+def read_gists(username, print_all):
+    """ Attempt to read existing gists from logfile with username """
+
+    filename = "/tmp/gist_fetch_{}.log".format(username)
+    file_gists = []
+    try:
+        with open(filename, 'r') as logfile:
+            file_gists = json.load(logfile)
+        if print_all:
+            print("Gists from last run:")
+            for old_gist in file_gists:
+                print(old_gist)
+    except FileNotFoundError:
+        print("{} doesn't exist, first run.".format(filename))
+
+    return file_gists
+
+
+def write_gists(gists, username):
+    """ Attempt to write existing and new gists to logfile with username """
+
+    filename = "/tmp/gist_fetch_{}.log".format(username)
+    try:
+        with open(filename, 'w') as logfile:
+            json.dump(gists, logfile)
+    except PermissionError:
+        print("Error writing to {}".format(filename))
+        sys.exit()
+
+
+def compare_gists(old, new):
+    """ Don't need to do any counting or date checking: there may be the same
+    number of gists, but new entries and deletions """
+
+    new_gists = []
+    deleted_gists = []
+
+    for new_entry in new:
+        if str(new_entry) not in str(old):
+            new_gists.append(new_entry)
+
+    for old_entry in old:
+        if str(old_entry) not in str(new):
+            deleted_gists.append(old_entry)
+
+    return new_gists, deleted_gists
+
+
+def execute():
+    """ Get old gists, new gists, compare, output, write file """
+
+    write_file = False
+    username, print_all, deleted, rate = get_args()
+    if rate:
+        rate_limit()
+        sys.exit()
+    last_run = read_gists(username, print_all)
+    gists = get_gists(username)
+    new_gists, deleted_gists = compare_gists(last_run, gists)
+
+    if not deleted_gists == [] and deleted:
+        print("Found {} deleted gists:".format(len(deleted_gists)))
+        for del_gist in deleted_gists:
+            print(del_gist)
+        write_file = True
+    if not new_gists == []:
+        print("Found {} new gists:".format(len(new_gists)))
+        for new_gist in new_gists:
+            print(new_gist)
+        write_file = True
+    else:
+        print("No new gists found.".format(len(last_run)))
+    if write_file:
+        write_gists(gists, username)
+    print("Total gists for {}: {}".format(username, len(gists)))
+
+
+execute()
